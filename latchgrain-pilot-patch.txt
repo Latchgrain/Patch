@@ -1,0 +1,2484 @@
+diff --git a/PILOT_CHANGES.md b/PILOT_CHANGES.md
+new file mode 100644
+index 0000000..5df22b3
+--- /dev/null
++++ b/PILOT_CHANGES.md
+@@ -0,0 +1,84 @@
++# Latchgrain pilot changes
++
++This patch turns the SQLite import into a working query engine and ships the
++2024 Toyota VIN Reference as the first real dataset, at $0.00 per query.
++
++## What changed
++
++**Imported datasets can now be queried.**
++- `ProviderDatasetImport.sourceDatabase` (new, nullable) keeps the uploaded
++  SQLite file on the server. `ProviderDatasetImportTable.queryableColumns` (new)
++  lists which columns buyers may filter on.
++- New endpoint `GET/POST /api/datasets/:slug/query`:
++  - `GET` returns the queryable tables and columns, the price, and the caller's
++    access state and remaining queries.
++  - `POST {table, filters, responseMode}` runs a parameterized, exact-match
++    (case-insensitive) filter query.
++  - Response modes: `answer_only` (exactly one match, otherwise "ambiguous"),
++    `summarized_data` (counts of distinct values per column), and `raw_records`
++    (up to 25 rows, flagged when truncated).
++  - Every result carries provenance. If the table has a `source_id` column and
++    the database has a `sources` table, those sources are cited with their URLs.
++  - Callers sign in or use an approved AI-application API key. The dataset
++    owner and admins can always query. Everyone else needs an APPROVED access
++    request.
++  - Each query is written to the usage ledger with its price and revenue share.
++    The ledger stores counts and provenance only, never the returned rows.
++- The dataset detail page shows a query form (table, filters, mode, results,
++  sources) to anyone allowed to query, and an access notice to everyone else.
++- The admin SQLite import now stores the file, makes every column filterable by
++  default, and sets the importing admin as owner. Before this, imported
++  datasets had no owner, so the ledger silently skipped every query.
++
++**Bugs fixed**
++- The query cap is now per requester. It used to count every buyer's queries
++  together, so 100 total queries shut the dataset off for everyone. The
++  anonymous homepage demo keeps a dataset-wide cap.
++- The dataset owner and admins no longer need to approve their own access
++  request before querying.
++- Only admins can change revenue share. Providers previously could set their own
++  share, up to 100%, and overwrite the admin's value.
++- Query history no longer fails completely when one stored row is unreadable.
++  That row is skipped.
++- The provider workspace hides the automotive-only filter toggles on other
++  datasets.
++- `sql.js` is marked as a server-external package, so its WebAssembly file
++  loads reliably in production.
++
++**First dataset**
++- `data/toyota_2024_vin_reference.sqlite` is seeded on every boot, idempotently,
++  as "2024 Toyota VIN Reference" by "Latchgrain Open Data":
++  - Published and approved, at $0.00 per query, with 1,000 queries per requester.
++  - Owned by the `POLSIA_OWNER_EMAIL` account, or else the oldest verified admin.
++  - Queryable tables: `models`, `powertrain_configurations`,
++    `model_configuration_summary`, `vin_position_rules`, `vpic_decoder_fields`,
++    `wmi_codes`, and `sources`.
++  - Later admin edits to price, name, or status are not overwritten.
++
++## Database
++
++The changes are additive only: one nullable column and one column with a
++default. Polsia's startup `prisma db push` applies them. No data migration is
++needed.
++
++## Verification
++
++- Typecheck is clean and the production build succeeds.
++- 589/589 unit tests pass, including 20 new tests:
++  - Engine tests run real queries against the bundled Toyota database, with no
++    mocks.
++  - Route tests cover access rules, the per-requester cap, ledger shape, and
++    API keys.
++- Not run: the Postgres integration tests and the Playwright browser tests.
++  These need a live database. Check them after deploying.
++
++## After deploying: smoke test
++
++1. Sign in as the owner account and open `/datasets/toyota-2024-vin-reference`.
++2. Query table `models` with `model_name = Prius` in Answer only mode. You
++   should get one record with an NHTSA source link.
++3. Query table `vin_position_rules` with `position_start = 10`. You should get
++   `code_for_2024 = R`.
++4. Check `/admin/usage-ledger`. Both queries should appear at $0.00.
++5. From a second account, request access, approve it, run a query, and check
++   that the remaining-queries count goes down.
+diff --git a/next.user-config.ts b/next.user-config.ts
+index 7d5418a..08e4e8b 100644
+--- a/next.user-config.ts
++++ b/next.user-config.ts
+@@ -50,7 +50,12 @@ export const cspExtraSources: CspExtraSources = {
+ };
+ 
+ /** Package-level Next options (transpilePackages, experimental.optimizePackageImports, …). */
+-export const userNextConfig: NextConfig = { agentRules: false };
++export const userNextConfig: NextConfig = {
++  agentRules: false,
++  // sql.js loads its WebAssembly file from node_modules at runtime; keep it out
++  // of the server bundle so imported-dataset queries load it the same way tests do.
++  serverExternalPackages: ['sql.js'],
++};
+ 
+ export type ConfigPlugin = (config: NextConfig) => NextConfig;
+ 
+diff --git a/prisma/schema/sqlite-dataset-import.prisma b/prisma/schema/sqlite-dataset-import.prisma
+index d4ae327..e2dc144 100644
+--- a/prisma/schema/sqlite-dataset-import.prisma
++++ b/prisma/schema/sqlite-dataset-import.prisma
+@@ -7,6 +7,9 @@ model ProviderDatasetImport {
+   sourceFilename  String
+   sourceBytes     Int
+   tableCount      Int
++  // Uploaded SQLite file, kept server-side so approved requesters can run
++  // governed queries against it. Never returned by any API.
++  sourceDatabase  Bytes?
+   createdAt       DateTime                     @default(now())
+   tables          ProviderDatasetImportTable[]
+ 
+@@ -19,6 +22,8 @@ model ProviderDatasetImportTable {
+   name     String
+   rowCount Int
+   columns  Json
++  // Columns requesters may filter on. Empty means the table is not queryable.
++  queryableColumns String[] @default([])
+   datasetImport ProviderDatasetImport @relation(fields: [importId], references: [id], onDelete: Cascade)
+ 
+   @@unique([importId, name])
+diff --git a/src/app/api/admin/datasets/import/route.ts b/src/app/api/admin/datasets/import/route.ts
+index d336da2..ce1e634 100644
+--- a/src/app/api/admin/datasets/import/route.ts
++++ b/src/app/api/admin/datasets/import/route.ts
+@@ -148,8 +148,10 @@ export async function GET(request: Request) {
+ }
+ 
+ export async function POST(request: Request) {
++  let adminUserId: string;
+   try {
+-    await requireAdmin();
++    const session = await requireAdmin();
++    adminUserId = session.user.id;
+   } catch {
+     return forbidden();
+   }
+@@ -189,6 +191,10 @@ export async function POST(request: Request) {
+           detailSlug: body.detailSlug,
+           publicationStatus: 'DRAFT',
+           approvalStatus: 'APPROVED',
++          // The importing administrator owns the dataset until it is reassigned,
++          // so usage is attributed and the ledger records queries.
++          ownerId: adminUserId,
++          permittedQueryFields: [],
+         },
+         select: {
+           id: true,
+@@ -209,12 +215,15 @@ export async function POST(request: Request) {
+           datasetStableKey: dataset.stableKey,
+           sourceFilename: body.filename,
+           sourceBytes: bytes.length,
++          sourceDatabase: new Uint8Array(bytes),
+           tableCount: inspection.tables.length,
+           tables: {
+             create: inspection.tables.map((table) => ({
+               name: table.name,
+               rowCount: table.rowCount,
+               columns: table.columns,
++              // Every column is filterable by default; narrow this per table later.
++              queryableColumns: table.columns.map((column) => column.name),
+             })),
+           },
+         },
+diff --git a/src/app/api/automotive-query/route.ts b/src/app/api/automotive-query/route.ts
+index 7a59844..fb41d7e 100644
+--- a/src/app/api/automotive-query/route.ts
++++ b/src/app/api/automotive-query/route.ts
+@@ -344,7 +344,10 @@ export async function POST(req: Request) {
+     if (!dataset || dataset.accessType !== 'Query API') {
+       throw new Error('Automotive dataset pricing is unavailable.');
+     }
+-    if (!isAnonymousDemo && user && !isApiKeyRequest) {
++    const isOwnerOrAdmin =
++      user !== null &&
++      (dataset.ownerId === user.id || (user as { role?: string | null }).role === 'admin');
++    if (!isAnonymousDemo && user && !isApiKeyRequest && !isOwnerOrAdmin) {
+       const hasApprovedAccess = await hasApprovedDatasetAccess(dataset.id, user.id);
+       if (!hasApprovedAccess) {
+         return NextResponse.json(
+@@ -404,8 +407,14 @@ export async function POST(req: Request) {
+       try {
+         result = await prisma.$transaction(
+           async (transaction) => {
++            // Signed-in requesters each get their own cap. The anonymous demo keeps
++            // the dataset-wide cap so it cannot be used for unlimited free queries.
+             const usageCount = await transaction.usageLedger.count({
+-              where: { datasetId: dataset.id, outcome: 'success' },
++              where: {
++                datasetId: dataset.id,
++                outcome: 'success',
++                ...(actorUserId ? { userId: actorUserId } : {}),
++              },
+             });
+             if (usageCount >= maxQueries) {
+               throw new QueryLimitReachedError();
+diff --git a/src/app/api/datasets/[slug]/query/route.ts b/src/app/api/datasets/[slug]/query/route.ts
+new file mode 100644
+index 0000000..535d804
+--- /dev/null
++++ b/src/app/api/datasets/[slug]/query/route.ts
+@@ -0,0 +1,311 @@
++// @polsia:user-owned — governed query endpoint for imported (SQLite) datasets.
++//
++// GET  /api/datasets/:slug/query  → queryable tables/columns + caller's access state
++// POST /api/datasets/:slug/query  → run a filter query
++//
++// Authentication: a signed-in session, or `Authorization: Bearer <api key>` for an
++// approved AI application. The dataset owner and administrators can always
++// query; everyone else needs an APPROVED access request for this dataset.
++import 'server-only';
++
++import { AccountCapabilityType, type Prisma } from '@prisma/client';
++import { NextResponse } from 'next/server';
++import { hasAccountCapability } from '@/lib/account-capabilities';
++import { authorizeApiKey } from '@/lib/business/api-key-auth';
++import {
++  executeImportedQuery,
++  ImportedQueryValidationError,
++  openImportedDatabase,
++} from '@/lib/business/imported-dataset-query';
++import { recordUsageLedgerEntry } from '@/lib/business/usage-ledger';
++import {
++  IMPORTED_RAW_RECORD_LIMIT,
++  ImportedDatasetSchema,
++  type ImportedQueryAccess,
++  ImportedQueryRequest,
++  ImportedQueryResult,
++  ImportedResponseMode,
++  type ImportedStoredQuery,
++} from '@/lib/contracts/imported-dataset-query';
++import { prisma } from '@/lib/db';
++import { getSessionUser } from '@/lib/require-auth';
++
++export const dynamic = 'force-dynamic';
++
++type RouteContext = { params: Promise<{ slug: string }> };
++
++function errorResponse(status: number, code: string, message: string) {
++  return NextResponse.json({ error: { code, message } }, { status });
++}
++
++const notFound = () =>
++  errorResponse(404, 'NOT_FOUND', 'This dataset is not available for queries.');
++const internalError = () => errorResponse(500, 'INTERNAL_ERROR', 'Unable to process the query.');
++
++async function loadDataset(slug: string) {
++  const dataset = await prisma.marketplaceDataset.findUnique({
++    where: { detailSlug: slug },
++    select: {
++      id: true,
++      stableKey: true,
++      name: true,
++      provider: true,
++      accessType: true,
++      queryPriceCents: true,
++      revenueSharePercent: true,
++      maxQueries: true,
++      publicationStatus: true,
++      approvalStatus: true,
++      ownerId: true,
++    },
++  });
++  if (!dataset || dataset.accessType !== 'Query API') return null;
++  const imported = await prisma.providerDatasetImport.findUnique({
++    where: { datasetStableKey: dataset.stableKey },
++    include: { tables: { orderBy: { name: 'asc' } } },
++  });
++  if (!imported?.sourceDatabase) return null;
++  return { dataset, imported };
++}
++
++type Loaded = NonNullable<Awaited<ReturnType<typeof loadDataset>>>;
++
++type Principal = { userId: string; role: string | null; viaApiKey: boolean };
++
++// Returns null for anonymous callers. Throws a Response for an invalid API key.
++async function resolvePrincipal(request: Request): Promise<Principal | null> {
++  const apiKey = await authorizeApiKey(request);
++  if (apiKey) {
++    const user = await prisma.user.findUnique({
++      where: { id: apiKey.userId },
++      select: { role: true },
++    });
++    return { userId: apiKey.userId, role: user?.role ?? null, viaApiKey: true };
++  }
++  const user = await getSessionUser();
++  if (!user) return null;
++  return {
++    userId: user.id,
++    role: (user as { role?: string | null }).role ?? null,
++    viaApiKey: false,
++  };
++}
++
++async function resolveAccess(
++  loaded: Loaded,
++  principal: Principal | null,
++): Promise<ImportedQueryAccess> {
++  if (!principal) return 'sign_in_required';
++  if (loaded.dataset.ownerId === principal.userId) return 'owner';
++  if (principal.role === 'admin') return 'admin';
++  if (
++    !principal.viaApiKey &&
++    !(await hasAccountCapability(principal.userId, AccountCapabilityType.END_USER))
++  ) {
++    return 'capability_required';
++  }
++  const accessRequest = await prisma.datasetAccessRequest.findUnique({
++    where: { datasetId_userId: { datasetId: loaded.dataset.id, userId: principal.userId } },
++    select: { status: true },
++  });
++  return accessRequest?.status === 'APPROVED' ? 'approved' : 'request_required';
++}
++
++function isPublic(loaded: Loaded) {
++  return (
++    loaded.dataset.publicationStatus === 'PUBLISHED' && loaded.dataset.approvalStatus === 'APPROVED'
++  );
++}
++
++// Per-requester cap: each requester gets `maxQueries` successful queries.
++// Owners and administrators are not capped.
++async function remainingQueries(loaded: Loaded, principal: Principal, access: ImportedQueryAccess) {
++  if (access !== 'approved') return null;
++  const used = await prisma.usageLedger.count({
++    where: { datasetId: loaded.dataset.id, userId: principal.userId, outcome: 'success' },
++  });
++  return Math.max(loaded.dataset.maxQueries - used, 0);
++}
++
++function catalogFor(loaded: Loaded) {
++  return loaded.imported.tables.map((table) => ({
++    name: table.name,
++    rowCount: table.rowCount,
++    columns: Array.isArray(table.columns)
++      ? table.columns.flatMap((column) =>
++          column &&
++          typeof column === 'object' &&
++          'name' in column &&
++          typeof column.name === 'string'
++            ? [column.name]
++            : [],
++        )
++      : [],
++    queryableColumns: table.queryableColumns,
++  }));
++}
++
++export async function GET(request: Request, { params }: RouteContext) {
++  const { slug } = await params;
++  try {
++    const loaded = await loadDataset(slug);
++    if (!loaded) return notFound();
++
++    let principal: Principal | null;
++    try {
++      principal = await resolvePrincipal(request);
++    } catch (response) {
++      if (response instanceof Response) return response;
++      throw response;
++    }
++    const access = await resolveAccess(loaded, principal);
++    if (!isPublic(loaded) && access !== 'owner' && access !== 'admin') return notFound();
++
++    return NextResponse.json(
++      ImportedDatasetSchema.parse({
++        dataset: {
++          stableKey: loaded.dataset.stableKey,
++          name: loaded.dataset.name,
++          provider: loaded.dataset.provider,
++        },
++        source: {
++          filename: loaded.imported.sourceFilename,
++          importedAt: loaded.imported.createdAt.toISOString(),
++        },
++        tables: catalogFor(loaded).filter((table) => table.queryableColumns.length > 0),
++        responseModes: ImportedResponseMode.options,
++        rawRecordLimit: IMPORTED_RAW_RECORD_LIMIT,
++        queryPriceCents: loaded.dataset.queryPriceCents,
++        access,
++        remainingQueries: principal ? await remainingQueries(loaded, principal, access) : null,
++      }),
++    );
++  } catch {
++    return internalError();
++  }
++}
++
++export async function POST(request: Request, { params }: RouteContext) {
++  const { slug } = await params;
++  const parsed = ImportedQueryRequest.safeParse(await request.json().catch(() => null));
++
++  try {
++    const loaded = await loadDataset(slug);
++    if (!loaded) return notFound();
++
++    let principal: Principal | null;
++    try {
++      principal = await resolvePrincipal(request);
++    } catch (response) {
++      if (response instanceof Response) return response;
++      throw response;
++    }
++    const access = await resolveAccess(loaded, principal);
++    if (!isPublic(loaded) && access !== 'owner' && access !== 'admin') return notFound();
++    if (!principal || access === 'sign_in_required') {
++      return errorResponse(401, 'UNAUTHORIZED', 'Sign in or use an API key to query this dataset.');
++    }
++    if (access === 'capability_required') {
++      return errorResponse(403, 'FORBIDDEN', 'This account capability is required.');
++    }
++    if (access === 'request_required') {
++      return errorResponse(
++        403,
++        'DATASET_ACCESS_REQUIRED',
++        'Approved dataset access is required to run this query.',
++      );
++    }
++
++    if (!parsed.success) {
++      return NextResponse.json(
++        {
++          errors: Object.fromEntries(
++            parsed.error.issues.map((issue) => [issue.path.join('.') || 'request', issue.message]),
++          ),
++        },
++        { status: 400 },
++      );
++    }
++
++    const remaining = await remainingQueries(loaded, principal, access);
++    if (remaining === 0) {
++      return errorResponse(
++        429,
++        'QUERY_LIMIT_REACHED',
++        'You have used all queries included with your access to this dataset.',
++      );
++    }
++
++    const retrievedAt = new Date();
++    const database = await openImportedDatabase(
++      loaded.imported.id,
++      new Uint8Array(loaded.imported.sourceDatabase as Uint8Array),
++    );
++
++    let result: ImportedQueryResult;
++    try {
++      result = executeImportedQuery(database, catalogFor(loaded), parsed.data, {
++        datasetName: loaded.dataset.name,
++        provider: loaded.dataset.provider,
++        sourceFilename: loaded.imported.sourceFilename,
++        importedAt: loaded.imported.createdAt,
++        retrievedAt,
++      });
++    } catch (error) {
++      if (error instanceof ImportedQueryValidationError) {
++        return NextResponse.json({ errors: { [error.field]: error.message } }, { status: 400 });
++      }
++      throw error;
++    }
++
++    const storedQuery: ImportedStoredQuery = {
++      kind: 'imported_table',
++      table: parsed.data.table,
++      filters: parsed.data.filters,
++    };
++    if (loaded.dataset.ownerId) {
++      await recordUsageLedgerEntry({
++        userId: principal.userId,
++        providerId: loaded.dataset.ownerId,
++        datasetId: loaded.dataset.id,
++        datasetKey: loaded.dataset.stableKey,
++        datasetName: loaded.dataset.name,
++        provider: loaded.dataset.provider,
++        query: storedQuery as Prisma.InputJsonValue,
++        response:
++          result.status === 'matched'
++            ? {
++                kind: 'imported_table',
++                status: 'matched',
++                responseMode: result.responseMode,
++                table: result.table,
++                matchCount: result.matchCount,
++                recordCount:
++                  result.responseMode === 'raw_records'
++                    ? result.records.length
++                    : result.responseMode === 'answer_only'
++                      ? 1
++                      : 0,
++                truncated: result.responseMode === 'raw_records' ? result.truncated : false,
++                provenance: result.provenance,
++              }
++            : {
++                kind: 'imported_table',
++                status: result.status,
++                responseMode: result.responseMode,
++                table: result.table,
++                error: result.error,
++              },
++        outcome: result.status === 'matched' ? 'success' : 'failed',
++        queryPriceCents: loaded.dataset.queryPriceCents,
++        revenueSharePercent: loaded.dataset.revenueSharePercent,
++        retrievedAt,
++      });
++    }
++
++    // no_match / ambiguous are valid query outcomes, so they return 200 with a status field.
++    return NextResponse.json(ImportedQueryResult.parse(result));
++  } catch {
++    return internalError();
++  }
++}
+diff --git a/src/app/api/provider/datasets/[stableKey]/route.ts b/src/app/api/provider/datasets/[stableKey]/route.ts
+index 005a9cb..b68f34f 100644
+--- a/src/app/api/provider/datasets/[stableKey]/route.ts
++++ b/src/app/api/provider/datasets/[stableKey]/route.ts
+@@ -129,6 +129,24 @@ export async function PATCH(request: Request, { params }: RouteContext) {
+ 
+   const { stableKey } = await params;
+ 
++  // Revenue share is Latchgrain's commercial term with the provider, so only
++  // administrators may change it. Providers can still read it.
++  if (
++    (body.data.revenueSharePercent !== undefined ||
++      body.data.revenueShareEffectiveDate !== undefined) &&
++    (user as { role?: string | null }).role !== 'admin'
++  ) {
++    return NextResponse.json(
++      {
++        error: {
++          code: 'FORBIDDEN',
++          message: 'Revenue share is set by Latchgrain administrators.',
++        },
++      },
++      { status: 403 },
++    );
++  }
++
+   try {
+     const data = {
+       ...(body.data.status
+diff --git a/src/app/api/query-history/route.ts b/src/app/api/query-history/route.ts
+index f42260f..1292c84 100644
+--- a/src/app/api/query-history/route.ts
++++ b/src/app/api/query-history/route.ts
+@@ -13,6 +13,10 @@ import {
+   AutomotiveSummary,
+   VerifiedAutomotiveAnswer,
+ } from '@/lib/contracts/automotive-query';
++import {
++  ImportedStoredQueryMatched,
++  summarizeImportedQuery,
++} from '@/lib/contracts/imported-dataset-query';
+ import {
+   QueryHistoryAttribution,
+   type QueryHistoryAttribution as QueryHistoryAttributionType,
+@@ -149,6 +153,40 @@ function projectHistoryRow(
+   },
+   datasetHref: string | null,
+ ) {
++  const imported = ImportedStoredQueryMatched.safeParse(row.response);
++  if (imported.success) {
++    const [firstSource] = imported.data.provenance.citedSources;
++    return QueryHistoryItem.parse({
++      id: row.id,
++      datasetName: row.datasetName,
++      provider: row.provider,
++      createdAt: row.createdAt.toISOString(),
++      responseMode: imported.data.responseMode,
++      extractionLimit: null,
++      queryPriceCents: row.queryPriceCents,
++      querySummary: summarizeImportedQuery(row.query) ?? imported.data.table,
++      status: 'matched',
++      resultHref: null,
++      datasetHref,
++      attribution: QueryHistoryAttribution.parse({
++        verification: {
++          ...(firstSource
++            ? {
++                source:
++                  [firstSource.publisher, firstSource.title].filter(Boolean).join(' — ') ||
++                  firstSource.sourceId,
++              }
++            : { source: imported.data.provenance.sourceFilename }),
++        },
++        provenance: {
++          provider: imported.data.provenance.provider,
++          dataset: imported.data.provenance.dataset,
++          retrievedAt: imported.data.provenance.retrievedAt,
++        },
++      }),
++    });
++  }
++
+   const response = QueryHistoryStoredMatched.parse(row.response);
+   const completeResponse = AutomotiveStoredQueryMatched.safeParse(row.response);
+ 
+@@ -230,7 +268,14 @@ export async function GET(request: Request) {
+ 
+     return NextResponse.json(
+       QueryHistoryList.parse({
+-        items: rows.map((row) => projectHistoryRow(row, datasetHrefs.get(row.datasetId) ?? null)),
++        // One unreadable row must not take down the whole history list.
++        items: rows.flatMap((row) => {
++          try {
++            return [projectHistoryRow(row, datasetHrefs.get(row.datasetId) ?? null)];
++          } catch {
++            return [];
++          }
++        }),
+       }),
+     );
+   } catch {
+diff --git a/src/components/custom/admin-dataset-import.tsx b/src/components/custom/admin-dataset-import.tsx
+index 7a4312d..3d03155 100644
+--- a/src/components/custom/admin-dataset-import.tsx
++++ b/src/components/custom/admin-dataset-import.tsx
+@@ -157,8 +157,9 @@ export function AdminDatasetImport() {
+             </div>
+             <CardTitle>Import a SQLite dataset</CardTitle>
+             <CardDescription>
+-              Upload a bounded SQLite database to catalog every user table. Imported datasets are
+-              saved as drafts; source rows are not copied or exposed.
++              Upload a bounded SQLite database. It is stored server-side and becomes queryable
++              through governed filters; rows are never downloadable. Imported datasets start as
++              drafts owned by you.
+             </CardDescription>
+           </div>
+           <Badge variant="secondary" className="shrink-0">
+diff --git a/src/components/custom/dataset-detail.tsx b/src/components/custom/dataset-detail.tsx
+index 55612b3..5bc8adf 100644
+--- a/src/components/custom/dataset-detail.tsx
++++ b/src/components/custom/dataset-detail.tsx
+@@ -16,6 +16,7 @@ import { useEffect, useState } from 'react';
+ import { useForm } from 'react-hook-form';
+ import { toast } from 'sonner';
+ import { AutomotiveDemoQuery } from '@/components/custom/automotive-demo-query';
++import { ImportedDatasetQuery } from '@/components/custom/imported-dataset-query';
+ import { Badge } from '@/components/ui/badge';
+ import { Button } from '@/components/ui/button';
+ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+@@ -476,6 +477,15 @@ export function DatasetDetail({ slug }: DatasetDetailProps) {
+           </Card>
+         </section>
+       ) : null}
++
++      {dataset.stableKey !== 'automotive-vehicle-data' &&
++      dataset.accessType === 'Query API' &&
++      !isSessionLoading ? (
++        <ImportedDatasetQuery
++          slug={slug}
++          reloadKey={`${userId ?? 'anonymous'}:${requestState?.status ?? 'none'}`}
++        />
++      ) : null}
+     </div>
+   );
+ }
+diff --git a/src/components/custom/imported-dataset-query.tsx b/src/components/custom/imported-dataset-query.tsx
+new file mode 100644
+index 0000000..36f9c0e
+--- /dev/null
++++ b/src/components/custom/imported-dataset-query.tsx
+@@ -0,0 +1,445 @@
++// @polsia:user-owned — query surface for imported (SQLite) datasets on the detail page.
++'use client';
++
++import { LoaderCircle, Plus, ShieldAlert, Terminal, X } from 'lucide-react';
++import Link from 'next/link';
++import { useEffect, useMemo, useState } from 'react';
++import { Badge } from '@/components/ui/badge';
++import { Button } from '@/components/ui/button';
++import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
++import { Input } from '@/components/ui/input';
++import { Label } from '@/components/ui/label';
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from '@/components/ui/select';
++import { apiFetch } from '@/lib/api-client';
++import {
++  IMPORTED_MAX_FILTERS,
++  IMPORTED_RESPONSE_MODE_LABELS,
++  ImportedDatasetSchema,
++  type ImportedDatasetSchema as ImportedDatasetSchemaType,
++  ImportedQueryResult,
++  type ImportedQueryResult as ImportedQueryResultType,
++  type ImportedRecord,
++  type ImportedResponseMode,
++} from '@/lib/contracts/imported-dataset-query';
++import { formatQueryPrice } from '@/lib/contracts/marketplace-dataset';
++
++type FilterRow = { id: number; column: string; value: string };
++
++function formatCell(value: ImportedRecord[string]): string {
++  if (value === null || value === '') return '—';
++  return String(value);
++}
++
++function RecordTable({ record }: { record: ImportedRecord }) {
++  return (
++    <dl className="grid gap-x-6 gap-y-2 text-sm sm:grid-cols-[minmax(0,14rem)_1fr]">
++      {Object.entries(record).map(([key, value]) => (
++        <div key={key} className="contents">
++          <dt className="font-mono text-xs uppercase tracking-wide text-muted-foreground">{key}</dt>
++          <dd className="break-words">{formatCell(value)}</dd>
++        </div>
++      ))}
++    </dl>
++  );
++}
++
++function RecordsGrid({ records }: { records: ImportedRecord[] }) {
++  const columns = Object.keys(records[0] ?? {});
++  return (
++    <div className="max-w-full overflow-x-auto border border-border">
++      <table className="w-full text-left text-sm">
++        <thead className="bg-muted/40">
++          <tr>
++            {columns.map((column) => (
++              <th key={column} className="whitespace-nowrap px-3 py-2 font-mono text-xs uppercase">
++                {column}
++              </th>
++            ))}
++          </tr>
++        </thead>
++        <tbody>
++          {records.map((record, index) => (
++            // biome-ignore lint/suspicious/noArrayIndexKey: rows have no stable id
++            <tr key={index} className="border-t border-border align-top">
++              {columns.map((column) => (
++                <td key={column} className="px-3 py-2">
++                  {formatCell(record[column] ?? null)}
++                </td>
++              ))}
++            </tr>
++          ))}
++        </tbody>
++      </table>
++    </div>
++  );
++}
++
++function ResultView({ result }: { result: ImportedQueryResultType }) {
++  if (result.status !== 'matched') {
++    return (
++      <div className="border border-border bg-muted/20 p-4 text-sm">
++        <p className="font-medium">
++          {result.status === 'no_match' ? 'No match' : 'More than one match'}
++        </p>
++        <p className="mt-1 text-muted-foreground">{result.error.message}</p>
++      </div>
++    );
++  }
++
++  return (
++    <div className="space-y-5">
++      <div className="flex flex-wrap items-center gap-2">
++        <Badge variant="secondary" className="rounded-none">
++          {result.matchCount} {result.matchCount === 1 ? 'match' : 'matches'}
++        </Badge>
++        <Badge variant="outline" className="rounded-none">
++          {IMPORTED_RESPONSE_MODE_LABELS[result.responseMode]}
++        </Badge>
++        {result.responseMode === 'raw_records' && result.truncated ? (
++          <Badge variant="outline" className="rounded-none">
++            Showing first {result.records.length}
++          </Badge>
++        ) : null}
++      </div>
++
++      {result.responseMode === 'answer_only' ? <RecordTable record={result.answer} /> : null}
++      {result.responseMode === 'raw_records' ? <RecordsGrid records={result.records} /> : null}
++      {result.responseMode === 'summarized_data' ? (
++        <div className="grid gap-4 sm:grid-cols-2">
++          {result.summary.map((column) => (
++            <div key={column.column} className="border border-border p-3">
++              <p className="font-mono text-xs uppercase tracking-wide text-muted-foreground">
++                {column.column}
++              </p>
++              <ul className="mt-2 space-y-1 text-sm">
++                {column.distinctValues.map((entry) => (
++                  <li key={String(entry.value)} className="flex justify-between gap-3">
++                    <span className="break-words">{formatCell(entry.value)}</span>
++                    <span className="text-muted-foreground">{entry.count}</span>
++                  </li>
++                ))}
++                {column.truncated ? <li className="text-muted-foreground">…more values</li> : null}
++              </ul>
++            </div>
++          ))}
++        </div>
++      ) : null}
++
++      <div className="border-t border-border pt-4 text-sm">
++        <p className="font-mono text-xs font-semibold uppercase tracking-[0.2em] text-primary">
++          Provenance
++        </p>
++        <p className="mt-2 text-muted-foreground">
++          {result.provenance.dataset} · {result.provenance.provider} · retrieved{' '}
++          {new Date(result.provenance.retrievedAt).toLocaleString()}
++        </p>
++        {result.provenance.citedSources.length > 0 ? (
++          <ul className="mt-2 space-y-1">
++            {result.provenance.citedSources.map((source) => (
++              <li key={source.sourceId}>
++                {source.url ? (
++                  <a
++                    href={source.url}
++                    target="_blank"
++                    rel="noreferrer"
++                    className="underline underline-offset-4"
++                  >
++                    {source.title ?? source.sourceId}
++                  </a>
++                ) : (
++                  (source.title ?? source.sourceId)
++                )}
++                {source.publisher ? (
++                  <span className="text-muted-foreground"> — {source.publisher}</span>
++                ) : null}
++              </li>
++            ))}
++          </ul>
++        ) : null}
++      </div>
++    </div>
++  );
++}
++
++function QueryForm({ slug, schema }: { slug: string; schema: ImportedDatasetSchemaType }) {
++  const [tableName, setTableName] = useState(schema.tables[0]?.name ?? '');
++  const table = useMemo(
++    () => schema.tables.find((entry) => entry.name === tableName),
++    [schema.tables, tableName],
++  );
++  const [filters, setFilters] = useState<FilterRow[]>([]);
++  const [mode, setMode] = useState<ImportedResponseMode>('answer_only');
++  const [result, setResult] = useState<ImportedQueryResultType | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const [running, setRunning] = useState(false);
++  const [remaining, setRemaining] = useState(schema.remainingQueries);
++
++  useEffect(() => {
++    setFilters(
++      table?.queryableColumns[0] ? [{ id: 1, column: table.queryableColumns[0], value: '' }] : [],
++    );
++    setResult(null);
++    setError(null);
++  }, [table]);
++
++  function updateFilter(id: number, patch: Partial<FilterRow>) {
++    setFilters((rows) => rows.map((row) => (row.id === id ? { ...row, ...patch } : row)));
++  }
++
++  async function run() {
++    const active = filters.filter((row) => row.value.trim() !== '');
++    if (active.length === 0) {
++      setError('Enter a value for at least one filter.');
++      return;
++    }
++    setRunning(true);
++    setError(null);
++    try {
++      const response = await apiFetch(`/api/datasets/${encodeURIComponent(slug)}/query`, {
++        method: 'POST',
++        body: JSON.stringify({
++          table: tableName,
++          filters: Object.fromEntries(active.map((row) => [row.column, row.value.trim()])),
++          responseMode: mode,
++        }),
++        schema: ImportedQueryResult,
++      });
++      setResult(response);
++      if (response.status === 'matched' && remaining !== null) {
++        setRemaining(Math.max(remaining - 1, 0));
++      }
++    } catch (caught) {
++      const cause =
++        caught instanceof Error ? (caught.cause as Record<string, unknown> | null) : null;
++      const message =
++        (cause?.error as { message?: string } | undefined)?.message ??
++        Object.values((cause?.errors as Record<string, string> | undefined) ?? {})[0] ??
++        'The query could not be completed.';
++      setError(message);
++      setResult(null);
++    } finally {
++      setRunning(false);
++    }
++  }
++
++  if (!table) return <p className="text-sm text-muted-foreground">No queryable tables yet.</p>;
++
++  const usedColumns = new Set(filters.map((row) => row.column));
++
++  return (
++    <Card className="rounded-none border-border">
++      <CardHeader className="gap-2 p-6 sm:p-7">
++        <div className="flex items-center gap-3">
++          <Terminal className="size-5 text-primary" aria-hidden />
++          <p className="font-mono text-xs font-semibold uppercase tracking-[0.2em] text-primary">
++            Governed query
++          </p>
++        </div>
++        <CardTitle className="font-display text-2xl tracking-tight">Query this dataset</CardTitle>
++        <p className="text-sm text-muted-foreground">
++          {formatQueryPrice(schema.queryPriceCents)}
++          {remaining !== null
++            ? ` · ${remaining} queries remaining`
++            : ' · no query cap for your role'}
++        </p>
++      </CardHeader>
++      <CardContent className="space-y-6 p-6 pt-0 sm:p-7 sm:pt-0">
++        <div className="grid gap-4 sm:grid-cols-2">
++          <div className="space-y-2">
++            <Label htmlFor="imported-table">Table</Label>
++            <Select value={tableName} onValueChange={setTableName}>
++              <SelectTrigger id="imported-table" className="rounded-none">
++                <SelectValue />
++              </SelectTrigger>
++              <SelectContent>
++                {schema.tables.map((entry) => (
++                  <SelectItem key={entry.name} value={entry.name}>
++                    {entry.name} ({entry.rowCount} rows)
++                  </SelectItem>
++                ))}
++              </SelectContent>
++            </Select>
++          </div>
++          <div className="space-y-2">
++            <Label htmlFor="imported-mode">Response</Label>
++            <Select value={mode} onValueChange={(value) => setMode(value as ImportedResponseMode)}>
++              <SelectTrigger id="imported-mode" className="rounded-none">
++                <SelectValue />
++              </SelectTrigger>
++              <SelectContent>
++                {schema.responseModes.map((entry) => (
++                  <SelectItem key={entry} value={entry}>
++                    {IMPORTED_RESPONSE_MODE_LABELS[entry]}
++                  </SelectItem>
++                ))}
++              </SelectContent>
++            </Select>
++          </div>
++        </div>
++
++        <div className="space-y-3">
++          <Label>Filters</Label>
++          {filters.map((row) => (
++            <div key={row.id} className="flex flex-col gap-2 sm:flex-row">
++              <Select
++                value={row.column}
++                onValueChange={(column) => updateFilter(row.id, { column })}
++              >
++                <SelectTrigger className="rounded-none sm:w-64" aria-label="Filter column">
++                  <SelectValue />
++                </SelectTrigger>
++                <SelectContent>
++                  {table.queryableColumns.map((column) => (
++                    <SelectItem
++                      key={column}
++                      value={column}
++                      disabled={column !== row.column && usedColumns.has(column)}
++                    >
++                      {column}
++                    </SelectItem>
++                  ))}
++                </SelectContent>
++              </Select>
++              <Input
++                className="rounded-none"
++                aria-label={`Value for ${row.column}`}
++                placeholder="Exact value (case-insensitive)"
++                value={row.value}
++                onChange={(event) => updateFilter(row.id, { value: event.target.value })}
++                onKeyDown={(event) => {
++                  if (event.key === 'Enter') void run();
++                }}
++              />
++              {filters.length > 1 ? (
++                <Button
++                  type="button"
++                  variant="ghost"
++                  size="icon"
++                  aria-label="Remove filter"
++                  onClick={() => setFilters((rows) => rows.filter((entry) => entry.id !== row.id))}
++                >
++                  <X className="size-4" />
++                </Button>
++              ) : null}
++            </div>
++          ))}
++          {filters.length < Math.min(IMPORTED_MAX_FILTERS, table.queryableColumns.length) ? (
++            <Button
++              type="button"
++              variant="outline"
++              size="sm"
++              className="rounded-none"
++              onClick={() => {
++                const next = table.queryableColumns.find((column) => !usedColumns.has(column));
++                if (!next) return;
++                setFilters((rows) => [
++                  ...rows,
++                  {
++                    id: Math.max(0, ...rows.map((entry) => entry.id)) + 1,
++                    column: next,
++                    value: '',
++                  },
++                ]);
++              }}
++            >
++              <Plus className="size-4" /> Add filter
++            </Button>
++          ) : null}
++        </div>
++
++        <Button
++          type="button"
++          className="rounded-none"
++          disabled={running}
++          onClick={() => void run()}
++        >
++          {running ? <LoaderCircle className="size-4 animate-spin" /> : null}
++          {running ? 'Running query…' : 'Run query'}
++        </Button>
++
++        {error ? (
++          <p role="alert" className="text-sm text-destructive">
++            {error}
++          </p>
++        ) : null}
++        {result ? <ResultView result={result} /> : null}
++      </CardContent>
++    </Card>
++  );
++}
++
++function AccessNotice({ signedIn }: { signedIn: boolean }) {
++  return (
++    <Card className="rounded-none border-border bg-muted/20">
++      <CardHeader className="gap-3 p-6 sm:p-7">
++        <div className="flex items-center gap-3">
++          <ShieldAlert className="size-5 text-primary" aria-hidden />
++          <p className="font-mono text-xs font-semibold uppercase tracking-[0.2em] text-primary">
++            Query access
++          </p>
++        </div>
++        <CardTitle className="font-display text-2xl tracking-tight">
++          {signedIn
++            ? 'Approved access is required to run a query.'
++            : 'Sign in to query this dataset.'}
++        </CardTitle>
++        <p className="max-w-2xl leading-relaxed text-muted-foreground">
++          {signedIn ? (
++            'Submit an access request above. The query surface appears here once it is approved.'
++          ) : (
++            <>
++              <Link href="/login" className="underline underline-offset-4">
++                Sign in
++              </Link>{' '}
++              and request access to run governed queries against this source.
++            </>
++          )}
++        </p>
++      </CardHeader>
++    </Card>
++  );
++}
++
++/**
++ * Loads the imported-dataset schema for `slug`. Renders nothing when the
++ * dataset has no imported source (e.g. the automotive demo dataset).
++ */
++export function ImportedDatasetQuery({ slug, reloadKey }: { slug: string; reloadKey: string }) {
++  const [schema, setSchema] = useState<ImportedDatasetSchemaType | null>(null);
++
++  // biome-ignore lint/correctness/useExhaustiveDependencies: reloadKey intentionally re-fetches access after sign-in or approval changes.
++  useEffect(() => {
++    let cancelled = false;
++    apiFetch(`/api/datasets/${encodeURIComponent(slug)}/query`, { schema: ImportedDatasetSchema })
++      .then((value) => {
++        if (!cancelled) setSchema(value);
++      })
++      .catch(() => {
++        if (!cancelled) setSchema(null);
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [slug, reloadKey]);
++
++  if (!schema) return null;
++
++  const canQuery =
++    schema.access === 'owner' || schema.access === 'admin' || schema.access === 'approved';
++
++  return (
++    <section aria-label="Query this dataset" className="space-y-4">
++      {canQuery ? (
++        <QueryForm slug={slug} schema={schema} />
++      ) : (
++        <AccessNotice signedIn={schema.access !== 'sign_in_required'} />
++      )}
++    </section>
++  );
++}
+diff --git a/src/components/custom/provider-dataset-controls.tsx b/src/components/custom/provider-dataset-controls.tsx
+index e3f2953..5c804ed 100644
+--- a/src/components/custom/provider-dataset-controls.tsx
++++ b/src/components/custom/provider-dataset-controls.tsx
+@@ -574,7 +574,8 @@ export function ProviderDatasetControls() {
+                       id={`max-queries-help-${dataset.stableKey}`}
+                       className="mt-2 text-xs text-muted-foreground"
+                     >
+-                      Lifetime successful matches allowed: {dataset.maxQueries.toLocaleString()}
++                      Successful queries allowed per requester:{' '}
++                      {dataset.maxQueries.toLocaleString()}
+                     </p>
+                     {maxQueryErrors[dataset.stableKey] ? (
+                       <p role="alert" className="mt-1 text-xs text-destructive">
+@@ -582,70 +583,72 @@ export function ProviderDatasetControls() {
+                       </p>
+                     ) : null}
+                   </div>
+-                  <fieldset className="grid gap-3 border-t border-border pt-4">
+-                    <legend className="font-mono text-[0.65rem] uppercase tracking-[0.14em] text-muted-foreground">
+-                      Allowed query fields
+-                    </legend>
+-                    <p className="text-xs leading-relaxed text-muted-foreground">
+-                      Buyers can only filter this dataset with the fields you enable.
+-                    </p>
+-                    <div className="grid grid-cols-2 gap-3">
+-                      {AUTOMOTIVE_QUERY_FIELDS.map((field) => {
+-                        const checkboxId = `query-field-${dataset.stableKey}-${field}`;
+-                        const selectedFields = queryFieldDrafts[dataset.stableKey] ?? [];
+-                        return (
+-                          <label
+-                            key={field}
+-                            htmlFor={checkboxId}
+-                            className="flex min-w-0 items-center gap-2 text-sm text-foreground"
+-                          >
+-                            <Checkbox
+-                              id={checkboxId}
+-                              checked={selectedFields.includes(field)}
+-                              onCheckedChange={(checked) => {
+-                                setQueryFieldDrafts((current) => {
+-                                  const existing = current[dataset.stableKey] ?? [];
+-                                  const next = checked
+-                                    ? [...existing.filter((item) => item !== field), field]
+-                                    : existing.filter((item) => item !== field);
+-                                  return { ...current, [dataset.stableKey]: next };
+-                                });
+-                              }}
+-                              disabled={isSaving}
+-                            />
+-                            <span className="truncate">{AUTOMOTIVE_FIELD_LABELS[field]}</span>
+-                          </label>
+-                        );
+-                      })}
+-                    </div>
+-                    {(queryFieldDrafts[dataset.stableKey] ?? []).length === 0 ? (
+-                      <p className="text-xs leading-relaxed text-destructive">
+-                        No fields selected. Every automotive query will be rejected until you enable
+-                        at least one field.
++                  {dataset.stableKey === 'automotive-vehicle-data' ? (
++                    <fieldset className="grid gap-3 border-t border-border pt-4">
++                      <legend className="font-mono text-[0.65rem] uppercase tracking-[0.14em] text-muted-foreground">
++                        Allowed query fields
++                      </legend>
++                      <p className="text-xs leading-relaxed text-muted-foreground">
++                        Buyers can only filter this dataset with the fields you enable.
+                       </p>
+-                    ) : null}
+-                    <div className="flex flex-wrap items-center gap-3">
+-                      <Button
+-                        type="button"
+-                        variant="outline"
+-                        onClick={() => void updateQueryFields(dataset)}
+-                        disabled={
+-                          isSaving ||
+-                          sameFields(
+-                            queryFieldDrafts[dataset.stableKey] ?? [],
+-                            dataset.permittedQueryFields,
+-                          )
+-                        }
+-                      >
+-                        Save fields
+-                      </Button>
+-                      {queryFieldErrors[dataset.stableKey] ? (
+-                        <p role="alert" className="text-xs text-destructive">
+-                          {queryFieldErrors[dataset.stableKey]}
++                      <div className="grid grid-cols-2 gap-3">
++                        {AUTOMOTIVE_QUERY_FIELDS.map((field) => {
++                          const checkboxId = `query-field-${dataset.stableKey}-${field}`;
++                          const selectedFields = queryFieldDrafts[dataset.stableKey] ?? [];
++                          return (
++                            <label
++                              key={field}
++                              htmlFor={checkboxId}
++                              className="flex min-w-0 items-center gap-2 text-sm text-foreground"
++                            >
++                              <Checkbox
++                                id={checkboxId}
++                                checked={selectedFields.includes(field)}
++                                onCheckedChange={(checked) => {
++                                  setQueryFieldDrafts((current) => {
++                                    const existing = current[dataset.stableKey] ?? [];
++                                    const next = checked
++                                      ? [...existing.filter((item) => item !== field), field]
++                                      : existing.filter((item) => item !== field);
++                                    return { ...current, [dataset.stableKey]: next };
++                                  });
++                                }}
++                                disabled={isSaving}
++                              />
++                              <span className="truncate">{AUTOMOTIVE_FIELD_LABELS[field]}</span>
++                            </label>
++                          );
++                        })}
++                      </div>
++                      {(queryFieldDrafts[dataset.stableKey] ?? []).length === 0 ? (
++                        <p className="text-xs leading-relaxed text-destructive">
++                          No fields selected. Every automotive query will be rejected until you
++                          enable at least one field.
+                         </p>
+                       ) : null}
+-                    </div>
+-                  </fieldset>
++                      <div className="flex flex-wrap items-center gap-3">
++                        <Button
++                          type="button"
++                          variant="outline"
++                          onClick={() => void updateQueryFields(dataset)}
++                          disabled={
++                            isSaving ||
++                            sameFields(
++                              queryFieldDrafts[dataset.stableKey] ?? [],
++                              dataset.permittedQueryFields,
++                            )
++                          }
++                        >
++                          Save fields
++                        </Button>
++                        {queryFieldErrors[dataset.stableKey] ? (
++                          <p role="alert" className="text-xs text-destructive">
++                            {queryFieldErrors[dataset.stableKey]}
++                          </p>
++                        ) : null}
++                      </div>
++                    </fieldset>
++                  ) : null}
+                 </div>
+               ) : null}
+               <fieldset className="grid gap-3 border-t border-border pt-4">
+@@ -654,7 +657,7 @@ export function ProviderDatasetControls() {
+                 </legend>
+                 <p className="text-xs leading-relaxed text-muted-foreground">
+                   Set the provider share and the calendar date when this configuration takes effect.
+-                  Both fields are required together.
++                  Both fields are required together. Only Latchgrain administrators can change it.
+                 </p>
+                 <div className="grid gap-3 sm:grid-cols-2">
+                   <div className="grid gap-2">
+diff --git a/src/lib/business/imported-dataset-query.ts b/src/lib/business/imported-dataset-query.ts
+new file mode 100644
+index 0000000..f47d8d5
+--- /dev/null
++++ b/src/lib/business/imported-dataset-query.ts
+@@ -0,0 +1,262 @@
++// @polsia:user-owned — governed query execution against an imported SQLite dataset.
++import 'server-only';
++
++import type { Database, SqlValue } from 'sql.js';
++import { loadSqlite, quoteIdentifier } from '@/lib/business/sqlite-dataset-import';
++import {
++  IMPORTED_RAW_RECORD_LIMIT,
++  IMPORTED_SUMMARY_COLUMN_LIMIT,
++  IMPORTED_SUMMARY_VALUE_LIMIT,
++  type ImportedCitedSource,
++  type ImportedFilterValue,
++  type ImportedQueryRequest,
++  type ImportedQueryResult,
++  type ImportedRecord,
++} from '@/lib/contracts/imported-dataset-query';
++
++export class ImportedQueryValidationError extends Error {
++  constructor(
++    message: string,
++    readonly field: 'table' | 'filters',
++  ) {
++    super(message);
++    this.name = 'ImportedQueryValidationError';
++  }
++}
++
++export type ImportedTableCatalog = {
++  name: string;
++  columns: string[];
++  queryableColumns: string[];
++};
++
++export type ImportedQueryContext = {
++  datasetName: string;
++  provider: string;
++  sourceFilename: string;
++  importedAt: Date;
++  retrievedAt: Date;
++};
++
++// Small in-process cache so repeated queries don't re-parse the file. Keyed by
++// import id + byte length so a re-import is never served stale.
++const DATABASE_CACHE_LIMIT = 8;
++const databaseCache = new Map<string, Database>();
++
++export async function openImportedDatabase(cacheKey: string, bytes: Uint8Array): Promise<Database> {
++  const key = `${cacheKey}:${bytes.byteLength}`;
++  const cached = databaseCache.get(key);
++  if (cached) {
++    databaseCache.delete(key);
++    databaseCache.set(key, cached);
++    return cached;
++  }
++  const SQL = await loadSqlite();
++  const database = new SQL.Database(bytes);
++  databaseCache.set(key, database);
++  while (databaseCache.size > DATABASE_CACHE_LIMIT) {
++    const oldest = databaseCache.keys().next().value;
++    if (oldest === undefined) break;
++    databaseCache.get(oldest)?.close();
++    databaseCache.delete(oldest);
++  }
++  return database;
++}
++
++function toCell(value: SqlValue): string | number | boolean | null {
++  if (value === null || typeof value === 'string' || typeof value === 'number') return value;
++  return null; // binary blobs are never returned
++}
++
++function selectAll(
++  database: Database,
++  sql: string,
++  params: SqlValue[],
++): { columns: string[]; values: SqlValue[][] } {
++  const [result] = database.exec(sql, params);
++  return result ? { columns: result.columns, values: result.values } : { columns: [], values: [] };
++}
++
++function toRecords(result: { columns: string[]; values: SqlValue[][] }): ImportedRecord[] {
++  return result.values.map((row) =>
++    Object.fromEntries(result.columns.map((column, index) => [column, toCell(row[index] ?? null)])),
++  );
++}
++
++function sqliteObjectColumns(database: Database, name: string): string[] | null {
++  const kind = selectAll(
++    database,
++    "SELECT type FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')",
++    [name],
++  );
++  if (kind.values.length === 0) return null;
++  return selectAll(database, `PRAGMA table_info(${quoteIdentifier(name)})`, []).values.map((row) =>
++    String(row[1]),
++  );
++}
++
++function whereClause(filters: Record<string, ImportedFilterValue>) {
++  const clauses: string[] = [];
++  const params: SqlValue[] = [];
++  for (const [column, value] of Object.entries(filters)) {
++    if (typeof value === 'string') {
++      clauses.push(`TRIM(CAST(${quoteIdentifier(column)} AS TEXT)) = ? COLLATE NOCASE`);
++      params.push(value.trim());
++    } else {
++      clauses.push(`${quoteIdentifier(column)} = ?`);
++      params.push(typeof value === 'boolean' ? (value ? 1 : 0) : value);
++    }
++  }
++  return { sql: clauses.join(' AND '), params };
++}
++
++const SOURCE_FIELD_ALIASES: Record<keyof Omit<ImportedCitedSource, 'sourceId'>, string[]> = {
++  publisher: ['publisher', 'source_publisher', 'organization'],
++  title: ['title', 'source_title', 'name'],
++  url: ['url', 'source_url', 'link'],
++  accessedDate: ['accessed_date', 'accessed_at', 'retrieved_at'],
++};
++
++// Convention: if the queried table has a `source_id` column and the database
++// contains a `sources` table keyed by `source_id`, cite those sources.
++function citedSources(
++  database: Database,
++  table: string,
++  where: { sql: string; params: SqlValue[] },
++  tableColumns: string[],
++): ImportedCitedSource[] {
++  if (!tableColumns.includes('source_id')) return [];
++  const sourceColumns = sqliteObjectColumns(database, 'sources');
++  if (!sourceColumns?.includes('source_id')) return [];
++
++  const ids = selectAll(
++    database,
++    `SELECT DISTINCT source_id FROM ${quoteIdentifier(table)} WHERE ${where.sql} AND source_id IS NOT NULL LIMIT 20`,
++    where.params,
++  ).values.map((row) => String(row[0]));
++  if (ids.length === 0) return [];
++
++  const rows = toRecords(
++    selectAll(
++      database,
++      `SELECT * FROM sources WHERE source_id IN (${ids.map(() => '?').join(', ')})`,
++      ids,
++    ),
++  );
++  return rows.map((row) => {
++    const cited: ImportedCitedSource = { sourceId: String(row.source_id) };
++    for (const [field, aliases] of Object.entries(SOURCE_FIELD_ALIASES)) {
++      const alias = aliases.find((name) => typeof row[name] === 'string' && row[name] !== '');
++      if (alias) cited[field as keyof typeof SOURCE_FIELD_ALIASES] = String(row[alias]);
++    }
++    return cited;
++  });
++}
++
++export function executeImportedQuery(
++  database: Database,
++  catalog: ImportedTableCatalog[],
++  request: ImportedQueryRequest,
++  context: ImportedQueryContext,
++): ImportedQueryResult {
++  const table = catalog.find((entry) => entry.name === request.table);
++  if (!table || table.queryableColumns.length === 0) {
++    throw new ImportedQueryValidationError('This table is not available for queries.', 'table');
++  }
++  const tableColumns = sqliteObjectColumns(database, table.name);
++  if (!tableColumns) {
++    throw new ImportedQueryValidationError('This table is not available for queries.', 'table');
++  }
++  for (const column of Object.keys(request.filters)) {
++    if (!table.queryableColumns.includes(column) || !tableColumns.includes(column)) {
++      throw new ImportedQueryValidationError(
++        `"${column}" is not a permitted filter for ${table.name}.`,
++        'filters',
++      );
++    }
++  }
++
++  const identifier = quoteIdentifier(table.name);
++  const where = whereClause(request.filters);
++  const matchCount = Number(
++    selectAll(database, `SELECT COUNT(*) FROM ${identifier} WHERE ${where.sql}`, where.params)
++      .values[0]?.[0] ?? 0,
++  );
++  const base = { table: table.name, responseMode: request.responseMode, matchCount };
++
++  if (matchCount === 0) {
++    return {
++      ...base,
++      status: 'no_match',
++      error: { code: 'NO_MATCH', message: 'No records match these filters.' },
++    };
++  }
++  if (request.responseMode === 'answer_only' && matchCount > 1) {
++    return {
++      ...base,
++      status: 'ambiguous',
++      error: {
++        code: 'AMBIGUOUS_MATCH',
++        message: `${matchCount} records match. Add filters to narrow to one, or use summarized data.`,
++      },
++    };
++  }
++
++  const provenance = {
++    dataset: context.datasetName,
++    provider: context.provider,
++    sourceFilename: context.sourceFilename,
++    importedAt: context.importedAt.toISOString(),
++    retrievedAt: context.retrievedAt.toISOString(),
++    citedSources: citedSources(database, table.name, where, tableColumns),
++  };
++
++  if (request.responseMode === 'answer_only') {
++    const [answer] = toRecords(
++      selectAll(database, `SELECT * FROM ${identifier} WHERE ${where.sql} LIMIT 1`, where.params),
++    );
++    return {
++      ...base,
++      status: 'matched',
++      responseMode: 'answer_only',
++      answer: answer ?? {},
++      provenance,
++    };
++  }
++
++  if (request.responseMode === 'summarized_data') {
++    const summary = tableColumns.slice(0, IMPORTED_SUMMARY_COLUMN_LIMIT).map((column) => {
++      const col = quoteIdentifier(column);
++      const values = selectAll(
++        database,
++        `SELECT ${col}, COUNT(*) FROM ${identifier} WHERE ${where.sql} GROUP BY ${col} ORDER BY COUNT(*) DESC, ${col} LIMIT ${IMPORTED_SUMMARY_VALUE_LIMIT + 1}`,
++        where.params,
++      ).values;
++      return {
++        column,
++        distinctValues: values
++          .slice(0, IMPORTED_SUMMARY_VALUE_LIMIT)
++          .map(([value, count]) => ({ value: toCell(value ?? null), count: Number(count) })),
++        truncated: values.length > IMPORTED_SUMMARY_VALUE_LIMIT,
++      };
++    });
++    return { ...base, status: 'matched', responseMode: 'summarized_data', summary, provenance };
++  }
++
++  const records = toRecords(
++    selectAll(
++      database,
++      `SELECT * FROM ${identifier} WHERE ${where.sql} LIMIT ${IMPORTED_RAW_RECORD_LIMIT}`,
++      where.params,
++    ),
++  );
++  return {
++    ...base,
++    status: 'matched',
++    responseMode: 'raw_records',
++    records,
++    extractionLimit: IMPORTED_RAW_RECORD_LIMIT,
++    truncated: matchCount > records.length,
++    provenance,
++  };
++}
+diff --git a/src/lib/business/sqlite-dataset-import.ts b/src/lib/business/sqlite-dataset-import.ts
+index aa20850..85c19b5 100644
+--- a/src/lib/business/sqlite-dataset-import.ts
++++ b/src/lib/business/sqlite-dataset-import.ts
+@@ -29,14 +29,14 @@ type ColumnRow = {
+ 
+ let sqlPromise: ReturnType<typeof initSqlJs> | undefined;
+ 
+-function loadSqlite() {
++export function loadSqlite() {
+   sqlPromise ??= initSqlJs({
+     locateFile: (file) => path.join(process.cwd(), 'node_modules/sql.js/dist', file),
+   });
+   return sqlPromise;
+ }
+ 
+-function quoteIdentifier(identifier: string) {
++export function quoteIdentifier(identifier: string) {
+   return `"${identifier.replaceAll('"', '""')}"`;
+ }
+ 
+diff --git a/src/lib/contracts/admin-usage-ledger.ts b/src/lib/contracts/admin-usage-ledger.ts
+index c50b3ac..4368b60 100644
+--- a/src/lib/contracts/admin-usage-ledger.ts
++++ b/src/lib/contracts/admin-usage-ledger.ts
+@@ -5,6 +5,7 @@ import {
+   AutomotiveQuery,
+   AutomotiveResponseMode,
+ } from '@/lib/contracts/automotive-query';
++import { summarizeImportedQuery } from '@/lib/contracts/imported-dataset-query';
+ import { QueryPriceCents } from '@/lib/contracts/marketplace-dataset';
+ import {
+   UsageLedgerOutcome,
+@@ -147,6 +148,8 @@ export function projectAdminLedgerResponse(value: unknown) {
+ }
+ 
+ export function summarizeAdminLedgerQuery(value: unknown): string {
++  const imported = summarizeImportedQuery(value);
++  if (imported) return imported;
+   const parsed = AutomotiveQuery.safeParse(value);
+   if (!parsed.success) return 'Unavailable';
+ 
+diff --git a/src/lib/contracts/imported-dataset-query.ts b/src/lib/contracts/imported-dataset-query.ts
+new file mode 100644
+index 0000000..435493a
+--- /dev/null
++++ b/src/lib/contracts/imported-dataset-query.ts
+@@ -0,0 +1,179 @@
++// @polsia:user-owned — client-safe contract for governed queries against imported datasets.
++import { z } from 'zod';
++
++export const IMPORTED_RAW_RECORD_LIMIT = 25;
++export const IMPORTED_SUMMARY_COLUMN_LIMIT = 12;
++export const IMPORTED_SUMMARY_VALUE_LIMIT = 10;
++export const IMPORTED_MAX_FILTERS = 10;
++
++export const ImportedResponseMode = z.enum(['answer_only', 'summarized_data', 'raw_records']);
++export type ImportedResponseMode = z.infer<typeof ImportedResponseMode>;
++
++export const IMPORTED_RESPONSE_MODE_LABELS: Record<ImportedResponseMode, string> = {
++  answer_only: 'Answer only',
++  summarized_data: 'Summarized data',
++  raw_records: `Raw records (up to ${IMPORTED_RAW_RECORD_LIMIT})`,
++};
++
++const Identifier = z.string().min(1).max(255);
++const FilterValue = z.union([z.string().trim().min(1).max(500), z.number().finite(), z.boolean()]);
++export type ImportedFilterValue = z.infer<typeof FilterValue>;
++
++export const ImportedQueryRequest = z
++  .object({
++    table: Identifier,
++    filters: z
++      .record(Identifier, FilterValue)
++      .refine((value) => Object.keys(value).length >= 1, 'Add at least one filter.')
++      .refine(
++        (value) => Object.keys(value).length <= IMPORTED_MAX_FILTERS,
++        `Use at most ${IMPORTED_MAX_FILTERS} filters.`,
++      ),
++    responseMode: ImportedResponseMode.default('answer_only'),
++  })
++  .strict();
++export type ImportedQueryRequest = z.infer<typeof ImportedQueryRequest>;
++
++// Stored in UsageLedger.query for imported-dataset queries.
++export const ImportedStoredQuery = z
++  .object({
++    kind: z.literal('imported_table'),
++    table: Identifier,
++    filters: z.record(Identifier, FilterValue),
++  })
++  .strict();
++export type ImportedStoredQuery = z.infer<typeof ImportedStoredQuery>;
++
++const CellValue = z.union([z.string(), z.number(), z.boolean(), z.null()]);
++export const ImportedRecord = z.record(z.string(), CellValue);
++export type ImportedRecord = z.infer<typeof ImportedRecord>;
++
++export const ImportedCitedSource = z
++  .object({
++    sourceId: z.string().min(1),
++    publisher: z.string().optional(),
++    title: z.string().optional(),
++    url: z.string().optional(),
++    accessedDate: z.string().optional(),
++  })
++  .strict();
++export type ImportedCitedSource = z.infer<typeof ImportedCitedSource>;
++
++export const ImportedProvenance = z
++  .object({
++    dataset: z.string().min(1),
++    provider: z.string().min(1),
++    sourceFilename: z.string().min(1),
++    importedAt: z.string().datetime(),
++    retrievedAt: z.string().datetime(),
++    citedSources: z.array(ImportedCitedSource),
++  })
++  .strict();
++export type ImportedProvenance = z.infer<typeof ImportedProvenance>;
++
++export const ImportedColumnSummary = z
++  .object({
++    column: z.string().min(1),
++    distinctValues: z.array(z.object({ value: CellValue, count: z.number().int() }).strict()),
++    truncated: z.boolean(),
++  })
++  .strict();
++
++const MatchedBase = z.object({
++  status: z.literal('matched'),
++  table: Identifier,
++  matchCount: z.number().int().positive(),
++  provenance: ImportedProvenance,
++});
++
++export const ImportedQueryMatched = z.discriminatedUnion('responseMode', [
++  MatchedBase.extend({
++    responseMode: z.literal('answer_only'),
++    answer: ImportedRecord,
++  }).strict(),
++  MatchedBase.extend({
++    responseMode: z.literal('summarized_data'),
++    summary: z.array(ImportedColumnSummary),
++  }).strict(),
++  MatchedBase.extend({
++    responseMode: z.literal('raw_records'),
++    records: z.array(ImportedRecord).max(IMPORTED_RAW_RECORD_LIMIT),
++    extractionLimit: z.literal(IMPORTED_RAW_RECORD_LIMIT),
++    truncated: z.boolean(),
++  }).strict(),
++]);
++export type ImportedQueryMatched = z.infer<typeof ImportedQueryMatched>;
++
++export const ImportedQueryNotMatched = z
++  .object({
++    status: z.enum(['no_match', 'ambiguous']),
++    responseMode: ImportedResponseMode,
++    table: Identifier,
++    matchCount: z.number().int().nonnegative(),
++    error: z
++      .object({ code: z.enum(['NO_MATCH', 'AMBIGUOUS_MATCH']), message: z.string().min(1) })
++      .strict(),
++  })
++  .strict();
++export type ImportedQueryNotMatched = z.infer<typeof ImportedQueryNotMatched>;
++
++export const ImportedQueryResult = z.union([ImportedQueryMatched, ImportedQueryNotMatched]);
++export type ImportedQueryResult = z.infer<typeof ImportedQueryResult>;
++
++// Ledger projection for a successful query. Deliberately excludes returned
++// rows and answers; only counts, mode, and provenance are retained.
++export const ImportedStoredQueryMatched = z
++  .object({
++    kind: z.literal('imported_table'),
++    status: z.literal('matched'),
++    responseMode: ImportedResponseMode,
++    table: Identifier,
++    matchCount: z.number().int().positive(),
++    recordCount: z.number().int().nonnegative(),
++    truncated: z.boolean(),
++    provenance: ImportedProvenance,
++  })
++  .strict();
++export type ImportedStoredQueryMatched = z.infer<typeof ImportedStoredQueryMatched>;
++
++export const ImportedQueryAccess = z.enum([
++  'owner',
++  'admin',
++  'approved',
++  'sign_in_required',
++  'request_required',
++  'capability_required',
++]);
++export type ImportedQueryAccess = z.infer<typeof ImportedQueryAccess>;
++
++export const ImportedDatasetSchema = z
++  .object({
++    dataset: z.object({ stableKey: z.string(), name: z.string(), provider: z.string() }).strict(),
++    source: z.object({ filename: z.string(), importedAt: z.string().datetime() }).strict(),
++    tables: z.array(
++      z
++        .object({
++          name: Identifier,
++          rowCount: z.number().int().nonnegative(),
++          columns: z.array(z.string()),
++          queryableColumns: z.array(z.string()),
++        })
++        .strict(),
++    ),
++    responseModes: z.array(ImportedResponseMode),
++    rawRecordLimit: z.literal(IMPORTED_RAW_RECORD_LIMIT),
++    queryPriceCents: z.number().int().nonnegative(),
++    access: ImportedQueryAccess,
++    remainingQueries: z.number().int().nonnegative().nullable(),
++  })
++  .strict();
++export type ImportedDatasetSchema = z.infer<typeof ImportedDatasetSchema>;
++
++export function summarizeImportedQuery(value: unknown): string | null {
++  const parsed = ImportedStoredQuery.safeParse(value);
++  if (!parsed.success) return null;
++  const filters = Object.entries(parsed.data.filters)
++    .map(([key, entry]) => `${key}=${String(entry)}`)
++    .join(' · ');
++  return `${parsed.data.table}: ${filters}`;
++}
+diff --git a/src/lib/contracts/usage-ledger.ts b/src/lib/contracts/usage-ledger.ts
+index 04b8c73..731ca95 100644
+--- a/src/lib/contracts/usage-ledger.ts
++++ b/src/lib/contracts/usage-ledger.ts
+@@ -5,6 +5,10 @@ import {
+   AutomotiveStoredQueryMatched,
+   DEFAULT_AUTOMOTIVE_RESPONSE_MODE,
+ } from '@/lib/contracts/automotive-query';
++import {
++  ImportedResponseMode,
++  ImportedStoredQueryMatched,
++} from '@/lib/contracts/imported-dataset-query';
+ import { QueryPriceCents } from '@/lib/contracts/marketplace-dataset';
+ 
+ export const UsageLedgerOutcome = z.enum(['success', 'denied', 'failed']);
+@@ -96,9 +100,23 @@ const UsageLedgerFailureResponse = z.union([
+ // This is the only response shape permitted in requester history storage. It
+ // deliberately excludes raw rows, internal identifiers, and unrestricted
+ // dataset fields while retaining the licensed result/history projection.
++// Imported-dataset outcomes carry kind: 'imported_table' so readers can
++// distinguish them from the automotive demo shapes.
++export const ImportedLedgerFailureResponse = z
++  .object({
++    kind: z.literal('imported_table'),
++    status: z.enum(['no_match', 'ambiguous', 'denied', 'failed']),
++    responseMode: ImportedResponseMode,
++    table: z.string().min(1),
++    error: z.object({ code: z.string().min(1), message: z.string().min(1) }).strict(),
++  })
++  .strict();
++
+ export const UsageLedgerStoredResponse = z.union([
+   AutomotiveStoredQueryMatched,
+   UsageLedgerFailureResponse,
++  ImportedStoredQueryMatched,
++  ImportedLedgerFailureResponse,
+ ]);
+ 
+ export type UsageLedgerStoredResponse = z.infer<typeof UsageLedgerStoredResponse>;
+diff --git a/src/lib/seed-toyota-vin-reference.ts b/src/lib/seed-toyota-vin-reference.ts
+new file mode 100644
+index 0000000..d1edbb2
+--- /dev/null
++++ b/src/lib/seed-toyota-vin-reference.ts
+@@ -0,0 +1,152 @@
++// @polsia:user-owned — idempotent seed for the 2024 Toyota VIN reference dataset.
++//
++// Source file: data/toyota_2024_vin_reference.sqlite, compiled by the owner from
++// public NHTSA vPIC, EPA/DOE FuelEconomy.gov, and Toyota sources (see its
++// `sources` table). Published at $0.00 per query. Safe to run on every boot:
++// dataset settings an administrator changes later are not overwritten.
++import { readFile } from 'node:fs/promises';
++import path from 'node:path';
++import type { Prisma, PrismaClient } from '@prisma/client';
++import { loadSqlite, quoteIdentifier } from '@/lib/business/sqlite-dataset-import';
++
++export const TOYOTA_DATASET_KEY = 'toyota-2024-vin-reference';
++const SOURCE_FILENAME = 'toyota_2024_vin_reference.sqlite';
++
++// Filterable columns per table/view. Descriptive free-text columns are
++// returned in results but not offered as filters.
++export const TOYOTA_QUERYABLE_COLUMNS: Record<string, string[]> = {
++  models: ['model_id', 'model_name', 'model_year', 'make_name'],
++  powertrain_configurations: [
++    'configuration_id',
++    'model_id',
++    'configuration_label',
++    'epa_model_label',
++    'body_class',
++    'drive_type',
++    'transmission',
++    'cylinders',
++    'fuel_type',
++    'fuel_type_primary',
++    'electrification',
++  ],
++  model_configuration_summary: [
++    'model_name',
++    'configuration_label',
++    'body_class',
++    'drive_type',
++    'transmission',
++    'cylinders',
++    'fuel_type',
++    'electrification',
++  ],
++  vin_position_rules: ['position_start', 'vin_section', 'field_name'],
++  vpic_decoder_fields: ['variable_id', 'field_name', 'category'],
++  wmi_codes: ['wmi', 'manufacturer_name', 'country', 'vehicle_type'],
++  sources: ['source_id', 'publisher'],
++};
++
++type CatalogEntry = {
++  name: string;
++  rowCount: number;
++  columns: Array<{ name: string; type: string; notNull: boolean; primaryKey: boolean }>;
++};
++
++export async function catalogSqliteFile(bytes: Uint8Array): Promise<CatalogEntry[]> {
++  const SQL = await loadSqlite();
++  const database = new SQL.Database(bytes);
++  try {
++    const names =
++      database.exec(
++        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
++      )[0]?.values ?? [];
++    return names.map(([name]) => {
++      const identifier = quoteIdentifier(String(name));
++      const columns = (database.exec(`PRAGMA table_info(${identifier})`)[0]?.values ?? []).map(
++        (row) => ({
++          name: String(row[1]),
++          type: String(row[2] ?? ''),
++          notNull: row[3] === 1,
++          primaryKey: typeof row[5] === 'number' && row[5] > 0,
++        }),
++      );
++      const rowCount = Number(
++        database.exec(`SELECT COUNT(*) FROM ${identifier}`)[0]?.values[0]?.[0] ?? 0,
++      );
++      return { name: String(name), rowCount, columns };
++    });
++  } finally {
++    database.close();
++  }
++}
++
++export async function seedToyotaVinReference(
++  prisma: PrismaClient,
++  ownerId: string | null,
++): Promise<void> {
++  let bytes: Uint8Array;
++  try {
++    bytes = new Uint8Array(await readFile(path.join(process.cwd(), 'data', SOURCE_FILENAME)));
++  } catch {
++    // The file is optional: without it, upload the SQLite file through
++    // Admin → Provider listing review → Import a SQLite dataset instead.
++    return;
++  }
++  const catalog = await catalogSqliteFile(bytes);
++
++  const dataset = await prisma.marketplaceDataset.upsert({
++    where: { stableKey: TOYOTA_DATASET_KEY },
++    create: {
++      stableKey: TOYOTA_DATASET_KEY,
++      name: '2024 Toyota VIN Reference',
++      provider: 'Latchgrain Open Data',
++      category: 'Automotive',
++      accessType: 'Query API',
++      queryPriceCents: 0,
++      revenueSharePercent: 0,
++      maxQueries: 1000,
++      permittedQueryFields: [],
++      detailSlug: TOYOTA_DATASET_KEY,
++      publicationStatus: 'PUBLISHED',
++      approvalStatus: 'APPROVED',
++      ...(ownerId ? { ownerId } : {}),
++    },
++    update: {
++      ...(ownerId ? { ownerId } : {}),
++    },
++    select: { id: true },
++  });
++
++  const imported = await prisma.providerDatasetImport.upsert({
++    where: { datasetStableKey: TOYOTA_DATASET_KEY },
++    create: {
++      datasetId: dataset.id,
++      datasetStableKey: TOYOTA_DATASET_KEY,
++      sourceFilename: SOURCE_FILENAME,
++      sourceBytes: bytes.byteLength,
++      sourceDatabase: bytes,
++      tableCount: catalog.length,
++    },
++    update: {
++      datasetId: dataset.id,
++      sourceBytes: bytes.byteLength,
++      sourceDatabase: bytes,
++      tableCount: catalog.length,
++    },
++    select: { id: true },
++  });
++
++  for (const entry of catalog) {
++    const columns = entry.columns as unknown as Prisma.InputJsonValue;
++    await prisma.providerDatasetImportTable.upsert({
++      where: { importId_name: { importId: imported.id, name: entry.name } },
++      create: {
++        importId: imported.id,
++        name: entry.name,
++        rowCount: entry.rowCount,
++        columns,
++        queryableColumns: TOYOTA_QUERYABLE_COLUMNS[entry.name] ?? [],
++      },
++      update: { rowCount: entry.rowCount, columns },
++    });
++  }
++}
+diff --git a/src/lib/seed.ts b/src/lib/seed.ts
+index 64fa4e3..1325d53 100644
+--- a/src/lib/seed.ts
++++ b/src/lib/seed.ts
+@@ -20,6 +20,7 @@
+ // imports it.
+ import { AUTOMOTIVE_QUERY_FIELDS } from '@/lib/contracts/automotive-query';
+ import { DEFAULT_DATASET_QUERIES } from '@/lib/contracts/provider-dataset';
++import { seedToyotaVinReference } from '@/lib/seed-toyota-vin-reference';
+ 
+ export async function seed(): Promise<void> {
+   const { prisma } = await import('@/lib/db');
+@@ -125,4 +126,14 @@ export async function seed(): Promise<void> {
+       ...(owner ? { ownerId: owner.id } : {}),
+     },
+   });
++
++  // First real dataset: 2024 Toyota VIN reference (open public sources, $0.00/query).
++  const fallbackAdmin = owner
++    ? null
++    : await prisma.user.findFirst({
++        where: { role: 'admin', emailVerified: true },
++        orderBy: { createdAt: 'asc' },
++        select: { id: true },
++      });
++  await seedToyotaVinReference(prisma, owner?.id ?? fallbackAdmin?.id ?? null);
+ }
+diff --git a/tests/unit/automotive-query/seed.test.ts b/tests/unit/automotive-query/seed.test.ts
+index 69e90c7..22ad072 100644
+--- a/tests/unit/automotive-query/seed.test.ts
++++ b/tests/unit/automotive-query/seed.test.ts
+@@ -9,6 +9,11 @@ const { capabilityCreateMany, datasetUpsert, userFindMany, vehicleUpsert } = vi.
+   vehicleUpsert: vi.fn().mockResolvedValue({}),
+ }));
+ 
++const { seedToyotaVinReference } = vi.hoisted(() => ({
++  seedToyotaVinReference: vi.fn().mockResolvedValue(undefined),
++}));
++vi.mock('@/lib/seed-toyota-vin-reference', () => ({ seedToyotaVinReference }));
++
+ vi.mock('@/lib/db', () => ({
+   prisma: {
+     automotiveVehicle: { upsert: vehicleUpsert },
+@@ -28,6 +33,7 @@ describe('automotive startup seed', () => {
+ 
+     expect(vehicleUpsert).toHaveBeenCalledTimes(8);
+     expect(datasetUpsert).toHaveBeenCalledTimes(2);
++    expect(seedToyotaVinReference).toHaveBeenCalledTimes(2);
+     const firstRunKeys = vehicleUpsert.mock.calls.slice(0, 4).map(([args]) => args.where.stableKey);
+     const secondRunKeys = vehicleUpsert.mock.calls.slice(4).map(([args]) => args.where.stableKey);
+     expect(secondRunKeys).toEqual(firstRunKeys);
+diff --git a/tests/unit/imported-dataset-query/engine.test.ts b/tests/unit/imported-dataset-query/engine.test.ts
+new file mode 100644
+index 0000000..c968e69
+--- /dev/null
++++ b/tests/unit/imported-dataset-query/engine.test.ts
+@@ -0,0 +1,163 @@
++// @polsia:user-owned — real SQLite query coverage against the bundled Toyota dataset.
++// @vitest-environment node
++import { readFile } from 'node:fs/promises';
++import path from 'node:path';
++import { beforeAll, describe, expect, it, vi } from 'vitest';
++
++vi.mock('server-only', () => ({}));
++
++import {
++  executeImportedQuery,
++  ImportedQueryValidationError,
++  openImportedDatabase,
++} from '@/lib/business/imported-dataset-query';
++import {
++  IMPORTED_RAW_RECORD_LIMIT,
++  ImportedQueryRequest,
++  ImportedQueryResult,
++} from '@/lib/contracts/imported-dataset-query';
++import { catalogSqliteFile, TOYOTA_QUERYABLE_COLUMNS } from '@/lib/seed-toyota-vin-reference';
++
++type Database = Awaited<ReturnType<typeof openImportedDatabase>>;
++let database: Database;
++let catalog: Array<{ name: string; columns: string[]; queryableColumns: string[] }>;
++
++const context = {
++  datasetName: '2024 Toyota VIN Reference',
++  provider: 'Latchgrain Open Data',
++  sourceFilename: 'toyota_2024_vin_reference.sqlite',
++  importedAt: new Date('2026-09-23T00:00:00.000Z'),
++  retrievedAt: new Date('2026-09-23T12:00:00.000Z'),
++};
++
++function run(request: unknown) {
++  const result = executeImportedQuery(
++    database,
++    catalog,
++    ImportedQueryRequest.parse(request),
++    context,
++  );
++  // Every engine result must satisfy the public response contract.
++  return ImportedQueryResult.parse(result);
++}
++
++beforeAll(async () => {
++  const bytes = new Uint8Array(
++    await readFile(path.join(process.cwd(), 'data', 'toyota_2024_vin_reference.sqlite')),
++  );
++  database = await openImportedDatabase('toyota-test', bytes);
++  const entries = await catalogSqliteFile(bytes);
++  catalog = entries.map((entry) => ({
++    name: entry.name,
++    columns: entry.columns.map((column) => column.name),
++    queryableColumns: TOYOTA_QUERYABLE_COLUMNS[entry.name] ?? [],
++  }));
++});
++
++describe('Toyota dataset catalog', () => {
++  it('catalogs every table plus the summary view with the documented row counts', async () => {
++    const counts = Object.fromEntries(
++      (
++        await catalogSqliteFile(
++          new Uint8Array(
++            await readFile(path.join(process.cwd(), 'data', 'toyota_2024_vin_reference.sqlite')),
++          ),
++        )
++      ).map((entry) => [entry.name, entry.rowCount]),
++    );
++    expect(counts).toMatchObject({
++      models: 22,
++      powertrain_configurations: 94,
++      vin_position_rules: 6,
++      vpic_decoder_fields: 19,
++      wmi_codes: 34,
++      sources: 8,
++      model_configuration_summary: 94,
++    });
++  });
++
++  it('only offers filter columns that exist in each table', () => {
++    for (const entry of catalog) {
++      for (const column of entry.queryableColumns) expect(entry.columns).toContain(column);
++    }
++  });
++});
++
++describe('imported dataset queries', () => {
++  it('answers a single-match lookup with the full record and cited sources', () => {
++    const result = run({ table: 'models', filters: { model_name: 'prius' } });
++    expect(result.status).toBe('matched');
++    if (result.status !== 'matched' || result.responseMode !== 'answer_only') throw new Error();
++    expect(result.answer.model_name).toBe('Prius');
++    expect(result.answer.model_year).toBe(2024);
++    expect(result.provenance.citedSources).toEqual([
++      expect.objectContaining({ sourceId: 'nhtsa_models_2024', publisher: 'NHTSA vPIC' }),
++    ]);
++    expect(result.provenance.citedSources[0]?.url).toMatch(/^https:\/\/vpic\.nhtsa\.dot\.gov\//);
++  });
++
++  it('reports ambiguity instead of guessing when answer-only matches many rows', () => {
++    const result = run({
++      table: 'powertrain_configurations',
++      filters: { electrification: 'Hybrid' },
++    });
++    expect(result.status).toBe('ambiguous');
++    expect(result.matchCount).toBeGreaterThan(1);
++  });
++
++  it('decodes the 2024 model-year VIN position', () => {
++    const result = run({ table: 'vin_position_rules', filters: { position_start: '10' } });
++    if (result.status !== 'matched' || result.responseMode !== 'answer_only') throw new Error();
++    expect(result.answer.code_for_2024).toBe('R');
++  });
++
++  it('accepts numeric filters against integer columns', () => {
++    const result = run({ table: 'vin_position_rules', filters: { position_start: 10 } });
++    expect(result.status).toBe('matched');
++  });
++
++  it('summarizes matching rows by column', () => {
++    const result = run({
++      table: 'model_configuration_summary',
++      filters: { model_name: 'RAV4' },
++      responseMode: 'summarized_data',
++    });
++    if (result.status !== 'matched' || result.responseMode !== 'summarized_data') throw new Error();
++    const drive = result.summary.find((column) => column.column === 'drive_type');
++    expect(drive?.distinctValues.length).toBeGreaterThan(0);
++    expect(result.summary.find((column) => column.column === 'model_name')?.distinctValues).toEqual(
++      [{ value: 'RAV4', count: result.matchCount }],
++    );
++  });
++
++  it('caps raw record extraction and flags truncation', () => {
++    const result = run({
++      table: 'powertrain_configurations',
++      filters: { fuel_type: 'Regular' },
++      responseMode: 'raw_records',
++    });
++    if (result.status !== 'matched' || result.responseMode !== 'raw_records') throw new Error();
++    expect(result.records.length).toBeLessThanOrEqual(IMPORTED_RAW_RECORD_LIMIT);
++    expect(result.truncated).toBe(result.matchCount > IMPORTED_RAW_RECORD_LIMIT);
++  });
++
++  it('returns no_match for values that are not present', () => {
++    const result = run({ table: 'wmi_codes', filters: { wmi: 'ZZZ' } });
++    expect(result.status).toBe('no_match');
++  });
++
++  it('rejects filters on columns the provider did not permit', () => {
++    expect(() => run({ table: 'models', filters: { market_alias_or_note: 'Corolla' } })).toThrow(
++      ImportedQueryValidationError,
++    );
++  });
++
++  it('rejects unknown tables and treats identifiers as data, not SQL', () => {
++    expect(() => run({ table: 'models; DROP TABLE models', filters: { model_name: 'x' } })).toThrow(
++      ImportedQueryValidationError,
++    );
++    const injected = run({ table: 'models', filters: { model_name: "x' OR '1'='1" } });
++    expect(injected.status).toBe('no_match');
++    expect(run({ table: 'models', filters: { model_name: 'Prius' } }).status).toBe('matched');
++  });
++});
+diff --git a/tests/unit/imported-dataset-query/route.test.ts b/tests/unit/imported-dataset-query/route.test.ts
+new file mode 100644
+index 0000000..27af878
+--- /dev/null
++++ b/tests/unit/imported-dataset-query/route.test.ts
+@@ -0,0 +1,208 @@
++// @polsia:user-owned — access, cap, and ledger coverage for the imported-dataset query route.
++// @vitest-environment node
++import { readFile } from 'node:fs/promises';
++import path from 'node:path';
++import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
++
++const mocks = vi.hoisted(() => ({
++  datasetFindUnique: vi.fn(),
++  importFindUnique: vi.fn(),
++  accessFindUnique: vi.fn(),
++  userFindUnique: vi.fn(),
++  ledgerCount: vi.fn(),
++  getSessionUser: vi.fn(),
++  hasAccountCapability: vi.fn(),
++  authorizeApiKey: vi.fn(),
++  recordUsageLedgerEntry: vi.fn(),
++}));
++
++vi.mock('server-only', () => ({}));
++vi.mock('@/lib/db', () => ({
++  prisma: {
++    marketplaceDataset: { findUnique: mocks.datasetFindUnique },
++    providerDatasetImport: { findUnique: mocks.importFindUnique },
++    datasetAccessRequest: { findUnique: mocks.accessFindUnique },
++    user: { findUnique: mocks.userFindUnique },
++    usageLedger: { count: mocks.ledgerCount },
++  },
++}));
++vi.mock('@/lib/require-auth', () => ({ getSessionUser: mocks.getSessionUser }));
++vi.mock('@/lib/account-capabilities', () => ({ hasAccountCapability: mocks.hasAccountCapability }));
++vi.mock('@/lib/business/api-key-auth', () => ({ authorizeApiKey: mocks.authorizeApiKey }));
++vi.mock('@/lib/business/usage-ledger', () => ({
++  recordUsageLedgerEntry: mocks.recordUsageLedgerEntry,
++}));
++
++import { GET, POST } from '@/app/api/datasets/[slug]/query/route';
++import { UsageLedgerStoredResponse } from '@/lib/contracts/usage-ledger';
++import { catalogSqliteFile, TOYOTA_QUERYABLE_COLUMNS } from '@/lib/seed-toyota-vin-reference';
++
++const context = { params: Promise.resolve({ slug: 'toyota-2024-vin-reference' }) };
++let importRow: Record<string, unknown>;
++
++const dataset = {
++  id: 'dataset-1',
++  stableKey: 'toyota-2024-vin-reference',
++  name: '2024 Toyota VIN Reference',
++  provider: 'Latchgrain Open Data',
++  accessType: 'Query API',
++  queryPriceCents: 0,
++  revenueSharePercent: 0,
++  maxQueries: 3,
++  publicationStatus: 'PUBLISHED',
++  approvalStatus: 'APPROVED',
++  ownerId: 'owner-1',
++};
++
++function post(body: unknown) {
++  return POST(
++    new Request('http://localhost/api/datasets/toyota-2024-vin-reference/query', {
++      method: 'POST',
++      body: JSON.stringify(body),
++    }),
++    context,
++  );
++}
++
++const priusQuery = { table: 'models', filters: { model_name: 'Prius' } };
++
++beforeAll(async () => {
++  const bytes = new Uint8Array(
++    await readFile(path.join(process.cwd(), 'data', 'toyota_2024_vin_reference.sqlite')),
++  );
++  const catalog = await catalogSqliteFile(bytes);
++  importRow = {
++    id: 'import-1',
++    sourceFilename: 'toyota_2024_vin_reference.sqlite',
++    sourceDatabase: bytes,
++    createdAt: new Date('2026-09-23T00:00:00.000Z'),
++    tables: catalog.map((entry) => ({
++      name: entry.name,
++      rowCount: entry.rowCount,
++      columns: entry.columns,
++      queryableColumns: TOYOTA_QUERYABLE_COLUMNS[entry.name] ?? [],
++    })),
++  };
++});
++
++beforeEach(() => {
++  vi.clearAllMocks();
++  mocks.datasetFindUnique.mockResolvedValue(dataset);
++  mocks.importFindUnique.mockResolvedValue(importRow);
++  mocks.authorizeApiKey.mockResolvedValue(null);
++  mocks.hasAccountCapability.mockResolvedValue(true);
++  mocks.accessFindUnique.mockResolvedValue(null);
++  mocks.ledgerCount.mockResolvedValue(0);
++});
++
++describe('GET /api/datasets/:slug/query', () => {
++  it('describes queryable tables to anonymous visitors without granting access', async () => {
++    mocks.getSessionUser.mockResolvedValue(null);
++    const response = await GET(new Request('http://localhost/x'), context);
++    const body = await response.json();
++    expect(response.status).toBe(200);
++    expect(body.access).toBe('sign_in_required');
++    expect(body.queryPriceCents).toBe(0);
++    expect(body.tables.map((table: { name: string }) => table.name)).toContain('models');
++  });
++
++  it('reports remaining per-requester queries for approved buyers', async () => {
++    mocks.getSessionUser.mockResolvedValue({ id: 'buyer-1', role: 'user' });
++    mocks.accessFindUnique.mockResolvedValue({ status: 'APPROVED' });
++    mocks.ledgerCount.mockResolvedValue(1);
++    const body = await (await GET(new Request('http://localhost/x'), context)).json();
++    expect(body.access).toBe('approved');
++    expect(body.remainingQueries).toBe(2);
++    expect(mocks.ledgerCount).toHaveBeenCalledWith({
++      where: { datasetId: 'dataset-1', userId: 'buyer-1', outcome: 'success' },
++    });
++  });
++
++  it('hides unpublished datasets from everyone but the owner and admins', async () => {
++    mocks.datasetFindUnique.mockResolvedValue({ ...dataset, publicationStatus: 'DRAFT' });
++    mocks.getSessionUser.mockResolvedValue({ id: 'buyer-1', role: 'user' });
++    expect((await GET(new Request('http://localhost/x'), context)).status).toBe(404);
++    mocks.getSessionUser.mockResolvedValue({ id: 'owner-1', role: 'user' });
++    expect((await GET(new Request('http://localhost/x'), context)).status).toBe(200);
++  });
++});
++
++describe('POST /api/datasets/:slug/query', () => {
++  it('requires sign-in', async () => {
++    mocks.getSessionUser.mockResolvedValue(null);
++    expect((await post(priusQuery)).status).toBe(401);
++  });
++
++  it('requires an approved access request for ordinary buyers', async () => {
++    mocks.getSessionUser.mockResolvedValue({ id: 'buyer-1', role: 'user' });
++    mocks.accessFindUnique.mockResolvedValue({ status: 'PENDING' });
++    const response = await post(priusQuery);
++    expect(response.status).toBe(403);
++    expect((await response.json()).error.code).toBe('DATASET_ACCESS_REQUIRED');
++    expect(mocks.recordUsageLedgerEntry).not.toHaveBeenCalled();
++  });
++
++  it('lets the owner query without an access request and records a ledger entry', async () => {
++    mocks.getSessionUser.mockResolvedValue({ id: 'owner-1', role: 'user' });
++    const response = await post(priusQuery);
++    const body = await response.json();
++    expect(response.status).toBe(200);
++    expect(body.status).toBe('matched');
++    expect(body.answer.model_name).toBe('Prius');
++    expect(mocks.accessFindUnique).not.toHaveBeenCalled();
++
++    const entry = mocks.recordUsageLedgerEntry.mock.calls[0]?.[0];
++    expect(entry).toMatchObject({
++      userId: 'owner-1',
++      providerId: 'owner-1',
++      outcome: 'success',
++      queryPriceCents: 0,
++      query: { kind: 'imported_table', table: 'models', filters: { model_name: 'Prius' } },
++    });
++    // The stored response passes the ledger contract and never includes the answer row.
++    expect(UsageLedgerStoredResponse.safeParse(entry.response).success).toBe(true);
++    expect(entry.response).not.toHaveProperty('answer');
++  });
++
++  it('lets administrators query', async () => {
++    mocks.getSessionUser.mockResolvedValue({ id: 'admin-1', role: 'admin' });
++    expect((await post(priusQuery)).status).toBe(200);
++  });
++
++  it('enforces the cap per requester', async () => {
++    mocks.getSessionUser.mockResolvedValue({ id: 'buyer-1', role: 'user' });
++    mocks.accessFindUnique.mockResolvedValue({ status: 'APPROVED' });
++    mocks.ledgerCount.mockResolvedValue(3);
++    const response = await post(priusQuery);
++    expect(response.status).toBe(429);
++    expect((await response.json()).error.code).toBe('QUERY_LIMIT_REACHED');
++  });
++
++  it('records no-match outcomes as failed with a contract-valid response', async () => {
++    mocks.getSessionUser.mockResolvedValue({ id: 'buyer-1', role: 'user' });
++    mocks.accessFindUnique.mockResolvedValue({ status: 'APPROVED' });
++    const response = await post({ table: 'wmi_codes', filters: { wmi: 'ZZZ' } });
++    expect((await response.json()).status).toBe('no_match');
++    const entry = mocks.recordUsageLedgerEntry.mock.calls[0]?.[0];
++    expect(entry.outcome).toBe('failed');
++    expect(UsageLedgerStoredResponse.safeParse(entry.response).success).toBe(true);
++  });
++
++  it('rejects filters on non-permitted columns with a 400', async () => {
++    mocks.getSessionUser.mockResolvedValue({ id: 'owner-1', role: 'user' });
++    const response = await post({ table: 'models', filters: { source_id: 'x' } });
++    expect(response.status).toBe(400);
++  });
++
++  it('accepts approved AI application API keys', async () => {
++    mocks.authorizeApiKey.mockResolvedValue({
++      userId: 'app-user',
++      apiKeyId: 'k',
++      applicationId: 'a',
++    });
++    mocks.userFindUnique.mockResolvedValue({ role: 'user' });
++    mocks.accessFindUnique.mockResolvedValue({ status: 'APPROVED' });
++    expect((await post(priusQuery)).status).toBe(200);
++    expect(mocks.getSessionUser).not.toHaveBeenCalled();
++  });
++});
+diff --git a/tests/unit/provider-datasets/controls.test.tsx b/tests/unit/provider-datasets/controls.test.tsx
+index 224badd..9030628 100644
+--- a/tests/unit/provider-datasets/controls.test.tsx
++++ b/tests/unit/provider-datasets/controls.test.tsx
+@@ -346,7 +346,7 @@ describe('ProviderDatasetControls', () => {
+       }),
+     );
+     expect(input.value).toBe('0');
+-    expect(container.textContent).toContain('Lifetime successful matches allowed: 0');
++    expect(container.textContent).toContain('Successful queries allowed per requester: 0');
+ 
+     await act(async () => root.unmount());
+   });
+diff --git a/tests/unit/provider-datasets/update-route.test.ts b/tests/unit/provider-datasets/update-route.test.ts
+index 247f40f..72a7d94 100644
+--- a/tests/unit/provider-datasets/update-route.test.ts
++++ b/tests/unit/provider-datasets/update-route.test.ts
+@@ -125,6 +125,19 @@ describe('provider dataset update route', () => {
+     expect(transaction).not.toHaveBeenCalled();
+   });
+ 
++  it('forbids non-admin providers from changing their own revenue share', async () => {
++    const response = await PATCH(
++      new Request('http://test/api/provider/datasets/automotive-vehicle-data', {
++        method: 'PATCH',
++        body: JSON.stringify({ revenueSharePercent: 100, revenueShareEffectiveDate: '2026-01-01' }),
++      }),
++      context,
++    );
++
++    expect(response.status).toBe(403);
++    expect(updateMany).not.toHaveBeenCalled();
++  });
++
+   it('rejects invalid status before touching the database', async () => {
+     const response = await PATCH(
+       new Request('http://test/api/provider/datasets/automotive-vehicle-data', {
+@@ -184,6 +197,7 @@ describe('provider dataset update route', () => {
+     { revenueSharePercent: 100, revenueShareEffectiveDate: '2026-12-31' },
+     { revenueSharePercent: 37.5, revenueShareEffectiveDate: '2026-09-15' },
+   ])('persists a valid revenue-share configuration: %j', async (configuration) => {
++    requireAuth.mockResolvedValue({ id: 'owner-1', role: 'admin' });
+     updateMany.mockResolvedValue({ count: 1 });
+     findFirst.mockResolvedValue({
+       ...publishedRow,
+@@ -211,6 +225,7 @@ describe('provider dataset update route', () => {
+   });
+ 
+   it('normalizes the effective date to UTC midnight', async () => {
++    requireAuth.mockResolvedValue({ id: 'owner-1', role: 'admin' });
+     updateMany.mockResolvedValue({ count: 1 });
+     findFirst.mockResolvedValue({
+       ...publishedRow,
+diff --git a/tests/unit/query-history/route.test.ts b/tests/unit/query-history/route.test.ts
+index 63c1fd8..83b2787 100644
+--- a/tests/unit/query-history/route.test.ts
++++ b/tests/unit/query-history/route.test.ts
+@@ -315,19 +315,16 @@ describe('query history route', () => {
+       error: { code: 'INTERNAL_ERROR', message: 'Unable to load query history.' },
+     });
+ 
++    // A malformed stored row is skipped rather than taking down the whole list.
+     ledgerFindMany.mockResolvedValueOnce([{ ...ownerRow, response: { answer: { records: [] } } }]);
+     const malformedResponse = await GET(new Request('http://test/api/query-history'));
+-    expect(malformedResponse.status).toBe(500);
+-    await expect(malformedResponse.json()).resolves.toEqual({
+-      error: { code: 'INTERNAL_ERROR', message: 'Unable to load query history.' },
+-    });
++    expect(malformedResponse.status).toBe(200);
++    await expect(malformedResponse.json()).resolves.toEqual({ items: [] });
+ 
+     ledgerFindMany.mockResolvedValueOnce([{ ...ownerRow, query: { records: ['hatchback'] } }]);
+     const malformedQuery = await GET(new Request('http://test/api/query-history'));
+-    expect(malformedQuery.status).toBe(500);
+-    await expect(malformedQuery.json()).resolves.toEqual({
+-      error: { code: 'INTERNAL_ERROR', message: 'Unable to load query history.' },
+-    });
++    expect(malformedQuery.status).toBe(200);
++    await expect(malformedQuery.json()).resolves.toEqual({ items: [] });
+   });
+ 
+   it('returns 403 before Prisma when the account lacks END_USER', async () => {
